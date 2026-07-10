@@ -25,8 +25,8 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 CONFIG = {
     # --- Parameter inferensi (samakan dengan skripsi) ---
-    "conf_threshold": 0.25,        # Ultralytics default; sesuaikan dgn skripsi
-    "imgsz": 640,                  # default training YOLOv8m; sesuaikan dgn skripsi
+    "conf_threshold": 0.5,        # Ultralytics default; sesuaikan dgn skripsi
+    "imgsz": 480,                  # default training YOLOv8m; sesuaikan dgn skripsi
 
     # Nama kelas HARUS sama dengan label pada dataset training.
     # Jika di dataset memakai nama lain (mis. "person"), ganti di sini.
