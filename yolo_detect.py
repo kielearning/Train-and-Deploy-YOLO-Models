@@ -1,49 +1,21 @@
-"""
-================================================================================
-Deteksi Aktivitas Pengisian BBM ke Jerigen di SPBU
-Universitas Sam Ratulangi (UNSRAT) - Teknik Informatika
-
-Model    : YOLOv8m (Ultralytics)  -  1 kelas: "jerigen" (index 0)
-Sumber   : VIDEO REKAMAN (sesuai ruang lingkup skripsi), gambar, atau folder.
-           Mode kamera (usb/picamera) disediakan opsional, TIDAK dipakai untuk
-           menghasilkan hasil eksperimen pada skripsi.
-================================================================================
-
-CATATAN KONSISTENSI SKRIPSI (penting, baca sebelum mengubah parameter)
---------------------------------------------------------------------------------
-Agar kode SESUAI dengan apa yang ditulis di Bab III/IV:
-
-  * IMGSZ dan CONF di sini HARUS sama dengan nilai yang dilaporkan di skripsi.
-    (default imgsz=640 mengikuti default training YOLOv8m; ubah hanya jika
-     skripsi memang melaporkan nilai lain.)
-
-  * Preprocessing (CLAHE/sharpen), filter ukuran bounding box, dan ROI adalah
-    langkah TAMBAHAN yang MENGUBAH keluaran deteksi. Semuanya NONAKTIF secara
-    default sehingga keluaran = output mentah model. Aktifkan HANYA bila
-    langkah tersebut benar-benar dijelaskan di metodologi skripsi.
-
-  * Metrik evaluasi (mAP, precision, recall, confusion matrix) untuk skripsi
-    sebaiknya diambil dari `model.val()` pada data uji, BUKAN dari skrip demo
-    ini. Skrip ini untuk demonstrasi/visualisasi deteksi pada video.
---------------------------------------------------------------------------------
-
-Contoh pemakaian:
-  python deteksi_jerigen.py --model my_model.pt --source video_uji.mp4
-  python deteksi_jerigen.py --model my_model.pt --source video_uji.mp4 --resolution 1280x720 --record
-  python deteksi_jerigen.py --model my_model.pt --source folder_gambar/
-"""
-
 import os
 import sys
 import glob
 import time
 import csv
 import argparse
+import threading
 from datetime import datetime, timedelta
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+try:
+    import requests  # untuk notifikasi Telegram (pip install requests)
+    REQUESTS_TERSEDIA = True
+except ImportError:
+    REQUESTS_TERSEDIA = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,13 +27,50 @@ CONFIG = {
     # --- Parameter inferensi (samakan dengan skripsi) ---
     "conf_threshold": 0.25,        # Ultralytics default; sesuaikan dgn skripsi
     "imgsz": 640,                  # default training YOLOv8m; sesuaikan dgn skripsi
-    "kelas_target": ["jerigen"],   # nama kelas dari label training
+
+    # Nama kelas HARUS sama dengan label pada dataset training.
+    # Jika di dataset memakai nama lain (mis. "person"), ganti di sini.
+    "kelas_target": ["jerigen", "orang", "nozzle"],
+
+    # Warna tetap per kelas target (BGR) agar konsisten antar frame/laporan.
+    "warna_kelas": {
+        "jerigen": (0, 140, 255),   # oranye
+        "orang":   (255, 128, 0),   # biru muda
+        "nozzle":  (0, 220, 0),     # hijau
+    },
+    "warna_default": (160, 160, 160),
+
+    # --- Logika indikasi pengisian ilegal ---
+    # Indikasi muncul bila JERIGEN + NOZZLE + ORANG terdeteksi pada frame yang
+    # sama (syarat orang bisa dimatikan dengan --tanpa-orang).
+    "indikasi_butuh_orang": True,
+    # Jarak maksimum (px) antara pusat jerigen dan pusat nozzle agar dianggap
+    # "berdekatan". Set None untuk menonaktifkan syarat jarak (cukup hadir
+    # bersamaan dalam satu frame).
+    "indikasi_jarak_maks": None,
+    # Indikasi harus bertahan minimal N frame BERTURUT-TURUT sebelum notifikasi
+    # dikirim — mencegah alarm palsu dari deteksi sesaat (1-2 frame).
+    "min_frame_indikasi": 5,
+
+    # --- NOTIFIKASI TELEGRAM (muncul di handphone) ---
+    # Cara setup:
+    #   1. Buka Telegram, cari @BotFather, kirim /newbot, ikuti instruksi
+    #      → dapat TOKEN (contoh: "123456:ABC-xxxx")
+    #   2. Cari bot barumu di Telegram, tekan START, kirim pesan apa saja
+    #   3. Buka https://api.telegram.org/bot<TOKEN>/getUpdates di browser
+    #      → cari "chat":{"id": 123456789} → itu CHAT_ID kamu
+    # Token/chat_id bisa diisi di sini, lewat argumen CLI, atau environment
+    # variable TELEGRAM_TOKEN dan TELEGRAM_CHAT_ID (paling aman).
+    "telegram_token": "",
+    "telegram_chat_id": "",
+    "notif_kirim_foto": True,      # kirim foto frame bersama pesan
+    "notif_cooldown": 60,          # jeda minimal antar-notifikasi (detik)
 
     # --- Logging hasil deteksi ---
-    "csv_file": "hasil_deteksi_jerigen.csv",
+    "csv_file": "hasil_deteksi_spbu.csv",
     "interval_catat": 30,          # catat tiap N frame agar CSV tidak membludak
-    "simpan_screenshot": False,    # screenshot otomatis saat ada deteksi
-    "folder_screenshot": "screenshot_jerigen",
+    "simpan_screenshot": False,    # screenshot otomatis saat ada indikasi
+    "folder_screenshot": "screenshot_deteksi",
 
     # --- FITUR OPSIONAL (default OFF; nyalakan hanya jika ada di metodologi) ---
     "gunakan_preprocess": False,   # CLAHE + sharpen sebelum inferensi
@@ -79,7 +88,8 @@ CONFIG = {
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Deteksi jerigen di SPBU dengan YOLOv8m (video rekaman).")
+        description="Deteksi jerigen, orang, dan nozzle di SPBU dengan YOLO "
+                    "(video rekaman/kamera/gambar).")
     p.add_argument('--model', required=True,
                    help='Path model YOLO, mis. "my_model.pt"')
     p.add_argument('--source', required=True,
@@ -94,6 +104,22 @@ def parse_args():
                    help='Rekam hasil deteksi ke output_deteksi.avi')
     p.add_argument('--no-display', action='store_true',
                    help='Jalankan tanpa jendela tampilan (untuk batch/headless)')
+    p.add_argument('--tanpa-orang', action='store_true',
+                   help='Indikasi cukup jerigen + nozzle saja (tanpa syarat orang)')
+    p.add_argument('--jarak-maks', type=int, default=None,
+                   help='[opsional] Jarak maks. (px) pusat jerigen–nozzle untuk indikasi')
+    p.add_argument('--min-frame', type=int, default=CONFIG["min_frame_indikasi"],
+                   help='Indikasi harus bertahan N frame berturut-turut sebelum '
+                        f'notifikasi dikirim (default {CONFIG["min_frame_indikasi"]})')
+    # Notifikasi Telegram
+    p.add_argument('--telegram-token', default=None,
+                   help='Token bot Telegram (atau set env TELEGRAM_TOKEN)')
+    p.add_argument('--telegram-chat', default=None,
+                   help='Chat ID Telegram tujuan (atau set env TELEGRAM_CHAT_ID)')
+    p.add_argument('--notif-cooldown', type=int, default=CONFIG["notif_cooldown"],
+                   help=f'Jeda minimal antar-notifikasi dlm detik (default {CONFIG["notif_cooldown"]})')
+    p.add_argument('--tanpa-foto', action='store_true',
+                   help='Kirim notifikasi teks saja tanpa foto frame')
     # Fitur opsional — hanya untuk yang dijelaskan di metodologi
     p.add_argument('--preprocess', action='store_true',
                    help='[opsional] Aktifkan CLAHE + sharpen sebelum inferensi')
@@ -102,7 +128,7 @@ def parse_args():
     p.add_argument('--roi', action='store_true',
                    help='[opsional] Batasi deteksi pada area ROI')
     p.add_argument('--screenshot', action='store_true',
-                   help='Simpan screenshot otomatis saat jerigen terdeteksi')
+                   help='Simpan screenshot otomatis saat ada indikasi ilegal')
     return p.parse_args()
 
 
@@ -115,19 +141,22 @@ def inisialisasi_csv(nama_file):
             csv.writer(f).writerow([
                 "No", "Tanggal", "Jam", "Nama_Objek", "Confidence_rata2(%)",
                 "Jumlah_Terdeteksi", "Waktu_Video", "Lebar_Box(px)",
-                "Tinggi_Box(px)", "Posisi_X", "Posisi_Y", "Sumber",
+                "Tinggi_Box(px)", "Posisi_X", "Posisi_Y",
+                "Indikasi_Ilegal", "Sumber",
             ])
         print(f"[INFO] File CSV dibuat: {nama_file}")
 
 
 def catat_csv(nama_file, no, nama_obj, conf, jumlah, waktu_vid,
-              lebar, tinggi, cx, cy, sumber):
+              lebar, tinggi, cx, cy, indikasi, sumber):
     now = datetime.now()
     with open(nama_file, 'a', newline='', encoding='utf-8') as f:
         csv.writer(f).writerow([
             no, now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"),
             nama_obj, f"{conf:.1f}", jumlah, waktu_vid,
-            lebar, tinggi, cx, cy, os.path.basename(sumber),
+            lebar, tinggi, cx, cy,
+            "YA" if indikasi else "TIDAK",
+            os.path.basename(sumber),
         ])
 
 
@@ -174,6 +203,135 @@ def dalam_roi(cx, cy):
             CONFIG["roi_y1"] <= cy <= CONFIG["roi_y2"])
 
 
+def kelas_target_dari(classname):
+    """Kembalikan nama kelas target yang cocok (mis. 'jerigen'), atau None."""
+    nama = classname.lower()
+    for k in CONFIG["kelas_target"]:
+        if k.lower() in nama:
+            return k
+    return None
+
+
+def warna_untuk(kelas_target, classidx):
+    if kelas_target and kelas_target in CONFIG["warna_kelas"]:
+        return CONFIG["warna_kelas"][kelas_target]
+    return CONFIG["warna_default"]
+
+
+def _kirim_telegram_worker(token, chat_id, pesan, frame_jpg):
+    """Worker yang berjalan di thread terpisah agar inferensi tidak terhambat
+    oleh koneksi internet yang lambat."""
+    try:
+        if frame_jpg is not None:
+            url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            r = requests.post(
+                url,
+                data={"chat_id": chat_id, "caption": pesan, "parse_mode": "HTML"},
+                files={"photo": ("deteksi.jpg", frame_jpg, "image/jpeg")},
+                timeout=15)
+        else:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            r = requests.post(
+                url,
+                data={"chat_id": chat_id, "text": pesan, "parse_mode": "HTML"},
+                timeout=15)
+        if r.status_code == 200:
+            print("[NOTIF] Notifikasi Telegram terkirim.")
+        else:
+            print(f"[NOTIF] Gagal kirim (HTTP {r.status_code}): {r.text[:120]}")
+    except Exception as e:
+        print(f"[NOTIF] Gagal kirim notifikasi: {e}")
+
+
+def kirim_notifikasi(frame, deteksi_frame, waktu_vid, sumber):
+    """Susun pesan lalu kirim notifikasi Telegram secara asinkron."""
+    token = CONFIG["telegram_token"]
+    chat_id = CONFIG["telegram_chat_id"]
+    if not token or not chat_id:
+        return
+    if not REQUESTS_TERSEDIA:
+        print("[NOTIF] Modul 'requests' belum terpasang: pip install requests")
+        return
+
+    now = datetime.now()
+    baris = []
+    for k in CONFIG["kelas_target"]:
+        if k in deteksi_frame:
+            data = deteksi_frame[k]
+            conf_avg = sum(d["conf"] for d in data) / len(data)
+            baris.append(f"• {k.capitalize()}: {len(data)} (conf {conf_avg:.0f}%)")
+
+    pesan = (
+        "🚨 <b>INDIKASI PENGISIAN BBM ILEGAL</b>\n"
+        f"🕐 {now.strftime('%d-%m-%Y %H:%M:%S')}\n"
+        f"🎞 Waktu video: {format_waktu(waktu_vid)}\n"
+        f"📹 Sumber: {os.path.basename(str(sumber))}\n"
+        + "\n".join(baris) +
+        "\n\nJerigen, nozzle, dan orang terdeteksi bersamaan di area SPBU."
+    )
+
+    frame_jpg = None
+    if CONFIG["notif_kirim_foto"] and frame is not None:
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if ok:
+            frame_jpg = buf.tobytes()
+
+    threading.Thread(
+        target=_kirim_telegram_worker,
+        args=(token, chat_id, pesan, frame_jpg),
+        daemon=True).start()
+
+
+def uji_koneksi_telegram():
+    """Kirim pesan uji saat program mulai, agar tahu konfigurasi benar."""
+    token, chat_id = CONFIG["telegram_token"], CONFIG["telegram_chat_id"]
+    if not token or not chat_id:
+        return False
+    if not REQUESTS_TERSEDIA:
+        print("[NOTIF] Modul 'requests' belum terpasang: pip install requests")
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id,
+                  "text": "✅ Sistem deteksi SPBU aktif. Notifikasi siap."},
+            timeout=15)
+        if r.status_code == 200:
+            print("[NOTIF] Koneksi Telegram OK — pesan uji terkirim.")
+            return True
+        print(f"[NOTIF] Uji koneksi gagal (HTTP {r.status_code}): {r.text[:120]}")
+    except Exception as e:
+        print(f"[NOTIF] Uji koneksi gagal: {e}")
+    return False
+
+
+def cek_indikasi_ilegal(deteksi_frame):
+    """Indikasi pengisian ilegal:
+    - jerigen DAN nozzle hadir pada frame yang sama;
+    - opsional: orang juga harus hadir (CONFIG['indikasi_butuh_orang']);
+    - opsional: jarak pusat jerigen–nozzle <= indikasi_jarak_maks (px).
+    """
+    ada_jerigen = "jerigen" in deteksi_frame
+    ada_nozzle = "nozzle" in deteksi_frame
+    ada_orang = "orang" in deteksi_frame
+
+    if not (ada_jerigen and ada_nozzle):
+        return False
+    if CONFIG["indikasi_butuh_orang"] and not ada_orang:
+        return False
+
+    jarak_maks = CONFIG["indikasi_jarak_maks"]
+    if jarak_maks is None:
+        return True
+
+    for j in deteksi_frame["jerigen"]:
+        for n in deteksi_frame["nozzle"]:
+            jarak = np.hypot(j["cx"] - n["cx"], j["cy"] - n["cy"])
+            if jarak <= jarak_maks:
+                return True
+    return False
+
+
 def tentukan_sumber(src):
     img_ext = ('.jpg', '.jpeg', '.png', '.bmp')
     vid_ext = ('.avi', '.mov', '.mp4', '.mkv', '.wmv')
@@ -201,13 +359,29 @@ def tentukan_sumber(src):
 def main():
     args = parse_args()
 
-    # Terapkan flag opsional ke CONFIG
+    # Terapkan flag ke CONFIG
     CONFIG["conf_threshold"] = args.thresh
     CONFIG["imgsz"] = args.imgsz
     CONFIG["gunakan_preprocess"] = args.preprocess
     CONFIG["gunakan_filter_ukuran"] = args.filter_size
     CONFIG["gunakan_roi"] = args.roi
     CONFIG["simpan_screenshot"] = args.screenshot
+    CONFIG["indikasi_butuh_orang"] = not args.tanpa_orang
+    CONFIG["min_frame_indikasi"] = args.min_frame
+    if args.jarak_maks is not None:
+        CONFIG["indikasi_jarak_maks"] = args.jarak_maks
+
+    # Konfigurasi notifikasi: prioritas CLI > environment variable > CONFIG
+    CONFIG["telegram_token"] = (args.telegram_token
+                                or os.environ.get("TELEGRAM_TOKEN")
+                                or CONFIG["telegram_token"])
+    CONFIG["telegram_chat_id"] = (args.telegram_chat
+                                  or os.environ.get("TELEGRAM_CHAT_ID")
+                                  or CONFIG["telegram_chat_id"])
+    CONFIG["notif_cooldown"] = args.notif_cooldown
+    if args.tanpa_foto:
+        CONFIG["notif_kirim_foto"] = False
+    notif_aktif = uji_koneksi_telegram()
 
     # --- Cek & muat model ---
     if not os.path.exists(args.model):
@@ -215,6 +389,13 @@ def main():
         sys.exit(1)
     model = YOLO(args.model, task='detect')
     labels = model.names
+
+    # Peringatkan bila ada kelas target yang tidak dikenal model
+    nama_kelas_model = [v.lower() for v in labels.values()]
+    for k in CONFIG["kelas_target"]:
+        if not any(k.lower() in n for n in nama_kelas_model):
+            print(f"[PERINGATAN] Kelas target '{k}' tidak ditemukan pada model. "
+                  f"Kelas model: {list(labels.values())}")
 
     # --- Tipe sumber ---
     source_type = tentukan_sumber(args.source)
@@ -277,26 +458,35 @@ def main():
 
     # --- Cetak konfigurasi efektif (berguna untuk lampiran skripsi) ---
     print("=" * 60)
-    print("  DETEKSI JERIGEN SPBU — YOLOv8m")
-    print(f"  Model             : {args.model}")
-    print(f"  Kelas model       : {list(labels.values())}")
-    print(f"  Sumber            : {args.source} ({source_type})")
-    print(f"  Conf threshold    : {CONFIG['conf_threshold']}")
-    print(f"  Imgsz inferensi   : {CONFIG['imgsz']}")
-    print(f"  Preprocessing     : {CONFIG['gunakan_preprocess']}")
-    print(f"  Filter ukuran box : {CONFIG['gunakan_filter_ukuran']}")
-    print(f"  ROI               : {CONFIG['gunakan_roi']}")
-    print("  Tekan 'Q' keluar | 'P' screenshot manual")
+    print("  DETEKSI JERIGEN + ORANG + NOZZLE — SPBU (YOLO)")
+    print(f"  Model               : {args.model}")
+    print(f"  Kelas model         : {list(labels.values())}")
+    print(f"  Kelas target        : {CONFIG['kelas_target']}")
+    print(f"  Sumber              : {args.source} ({source_type})")
+    print(f"  Conf threshold      : {CONFIG['conf_threshold']}")
+    print(f"  Imgsz inferensi     : {CONFIG['imgsz']}")
+    print(f"  Indikasi butuh orang: {CONFIG['indikasi_butuh_orang']}")
+    print(f"  Jarak maks indikasi : {CONFIG['indikasi_jarak_maks']}")
+    print(f"  Min. frame indikasi : {CONFIG['min_frame_indikasi']}")
+    print(f"  Notifikasi Telegram : {'AKTIF' if notif_aktif else 'nonaktif'}")
+    if notif_aktif:
+        print(f"  Cooldown notifikasi : {CONFIG['notif_cooldown']} detik")
+    print(f"  Preprocessing       : {CONFIG['gunakan_preprocess']}")
+    print(f"  Filter ukuran box   : {CONFIG['gunakan_filter_ukuran']}")
+    print(f"  ROI                 : {CONFIG['gunakan_roi']}")
+    print("  Tekan 'Q' keluar | 'S' pause | 'P' screenshot manual")
     print("=" * 60)
 
     # --- Variabel kontrol ---
-    bbox_colors = [(68, 148, 228), (88, 159, 106), (96, 202, 231),
-                   (159, 124, 168), (98, 118, 150)]
     frame_rate_buffer, fps_avg_len = [], 100
     avg_fps = 0.0
     img_count = frame_ke = screenshot_count = 0
     no_csv = 1
     frame_dicatat = -10**9
+    total_indikasi = 0
+    indikasi_beruntun = 0          # frame indikasi berturut-turut
+    waktu_notif_terakhir = 0.0     # untuk cooldown notifikasi
+    total_notif = 0
 
     # ── LOOP UTAMA ──────────────────────────────────────────────────────────
     while True:
@@ -337,11 +527,13 @@ def main():
                         imgsz=CONFIG["imgsz"], conf=CONFIG["conf_threshold"])
         detections = results[0].boxes
 
-        object_count = 0
+        # deteksi_frame: {"jerigen": [...], "orang": [...], "nozzle": [...]}
         deteksi_frame = {}
+        jumlah_per_kelas = {k: 0 for k in CONFIG["kelas_target"]}
 
         for i in range(len(detections)):
-            xmin, ymin, xmax, ymax = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
+            xyxy = detections[i].xyxy.cpu().numpy().reshape(-1)
+            xmin, ymin, xmax, ymax = xyxy[:4].astype(int)
             classidx = int(detections[i].cls.item())
             classname = labels[classidx]
             conf = float(detections[i].conf.item())
@@ -354,10 +546,10 @@ def main():
             if not dalam_roi(cx, cy):
                 continue
 
-            is_target = any(k.lower() in classname.lower()
-                            for k in CONFIG["kelas_target"])
+            kelas = kelas_target_dari(classname)
+            color = warna_untuk(kelas, classidx)
 
-            color = bbox_colors[classidx % len(bbox_colors)]
+            # Gambar bounding box + label
             cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
             label = f'{classname}: {int(conf * 100)}%'
             (tw, th), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -368,22 +560,43 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
             cv2.circle(frame, (cx, cy), 4, color, -1)
 
-            object_count += 1
-            if is_target:
-                deteksi_frame.setdefault(classname, []).append(
+            if kelas is not None:
+                jumlah_per_kelas[kelas] += 1
+                deteksi_frame.setdefault(kelas, []).append(
                     {"conf": conf * 100, "lebar": lebar, "tinggi": tinggi,
                      "cx": cx, "cy": cy})
 
-        # Screenshot otomatis
-        if (deteksi_frame and CONFIG["simpan_screenshot"]
+        # Cek indikasi pengisian ilegal (jerigen + nozzle + orang bersamaan)
+        indikasi = cek_indikasi_ilegal(deteksi_frame)
+        if indikasi:
+            total_indikasi += 1
+            indikasi_beruntun += 1
+        else:
+            indikasi_beruntun = 0
+
+        # ── NOTIFIKASI KE HANDPHONE (Telegram) ──────────────────────────
+        # Dikirim bila: indikasi bertahan >= min_frame_indikasi frame
+        # berturut-turut DAN sudah lewat masa cooldown.
+        if (notif_aktif
+                and indikasi_beruntun >= CONFIG["min_frame_indikasi"]
+                and (time.time() - waktu_notif_terakhir) >= CONFIG["notif_cooldown"]):
+            waktu_vid_notif = None
+            if source_type == 'video' and cap is not None:
+                waktu_vid_notif = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            kirim_notifikasi(frame, deteksi_frame, waktu_vid_notif, args.source)
+            waktu_notif_terakhir = time.time()
+            total_notif += 1
+
+        # Screenshot otomatis saat ada indikasi pengisian ilegal
+        if (indikasi and CONFIG["simpan_screenshot"]
                 and (frame_ke - frame_dicatat) >= CONFIG["interval_catat"]):
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             cv2.imwrite(
                 os.path.join(CONFIG["folder_screenshot"],
-                             f"jerigen_{ts}_{screenshot_count:04d}.jpg"), frame)
+                             f"indikasi_{ts}_{screenshot_count:04d}.jpg"), frame)
             screenshot_count += 1
 
-        # Catat CSV
+        # Catat CSV (satu baris per kelas target yang terdeteksi)
         if deteksi_frame and (frame_ke - frame_dicatat) >= CONFIG["interval_catat"]:
             waktu_vid = None
             if source_type == 'video' and cap is not None:
@@ -397,31 +610,43 @@ def main():
                           int(sum(d["tinggi"] for d in data) / n),
                           int(sum(d["cx"] for d in data) / n),
                           int(sum(d["cy"] for d in data) / n),
-                          args.source)
+                          indikasi, args.source)
                 print(f"[{no_csv}] {nama_kelas} | {n} objek | "
-                      f"conf {conf_avg:.1f}% | waktu {format_waktu(waktu_vid)}")
+                      f"conf {conf_avg:.1f}% | waktu {format_waktu(waktu_vid)}"
+                      f"{' | INDIKASI ILEGAL' if indikasi else ''}")
                 no_csv += 1
             frame_dicatat = frame_ke
 
-        # Overlay info
-        cv2.rectangle(frame, (0, 0), (300, 70), (0, 0, 0), cv2.FILLED)
+        # Overlay info per kelas
+        cv2.rectangle(frame, (0, 0), (320, 115), (0, 0, 0), cv2.FILLED)
+        y = 22
         if source_type in ('video', 'usb', 'picamera'):
-            cv2.putText(frame, f'FPS: {avg_fps:.1f}', (10, 22),
+            cv2.putText(frame, f'FPS: {avg_fps:.1f}', (10, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.putText(frame, f'Jerigen: {object_count}', (10, 44),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(frame, f'Tercatat: {no_csv - 1}', (10, 64),
+            y += 22
+        for k in CONFIG["kelas_target"]:
+            warna = CONFIG["warna_kelas"].get(k, (0, 255, 0))
+            cv2.putText(frame, f'{k.capitalize()}: {jumlah_per_kelas[k]}',
+                        (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, warna, 2)
+            y += 22
+        cv2.putText(frame, f'Tercatat: {no_csv - 1}', (10, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-        if deteksi_frame:
-            cv2.putText(frame, 'JERIGEN TERDETEKSI',
-                        (frame.shape[1] - 250, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # Peringatan indikasi ilegal
+        if indikasi:
+            cv2.putText(frame, 'INDIKASI PENGISIAN ILEGAL',
+                        (frame.shape[1] - 380, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
+        elif deteksi_frame:
+            cv2.putText(frame, 'OBJEK TERDETEKSI',
+                        (frame.shape[1] - 250, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         if recorder is not None:
             recorder.write(frame)
 
         if not args.no_display:
-            cv2.imshow('Deteksi Jerigen SPBU — YOLOv8m', frame)
+            cv2.imshow('Deteksi SPBU — Jerigen/Orang/Nozzle', frame)
             key = cv2.waitKey(0 if source_type in ('image', 'folder') else 5) & 0xFF
             if key in (ord('q'), ord('Q')):
                 print("\n[INFO] Dihentikan oleh pengguna.")
@@ -444,12 +669,14 @@ def main():
     # ── LAPORAN AKHIR ────────────────────────────────────────────────────────
     print("=" * 60)
     print("  DETEKSI SELESAI")
-    print(f"  Rata-rata FPS   : {avg_fps:.2f}")
-    print(f"  Total frame     : {frame_ke}")
-    print(f"  Baris CSV        : {no_csv - 1}")
-    print(f"  File CSV         : {CONFIG['csv_file']}")
+    print(f"  Rata-rata FPS      : {avg_fps:.2f}")
+    print(f"  Total frame        : {frame_ke}")
+    print(f"  Frame ber-indikasi : {total_indikasi}")
+    print(f"  Notifikasi terkirim: {total_notif}")
+    print(f"  Baris CSV          : {no_csv - 1}")
+    print(f"  File CSV           : {CONFIG['csv_file']}")
     if CONFIG["simpan_screenshot"]:
-        print(f"  Screenshot       : {screenshot_count} gambar")
+        print(f"  Screenshot         : {screenshot_count} gambar")
     print("=" * 60)
 
     if cap is not None:
